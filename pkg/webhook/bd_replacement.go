@@ -139,16 +139,19 @@ func (bdr *BlockDeviceReplacement) IsBDReplacementValid(newRG apis.RaidGroup, ol
 		return false, "the new blockdevice intended to use for replacement in invalid"
 	}
 
+	return true, ""
+}
+
+func (bdr *BlockDeviceReplacement) CreateBDCsForNewBDs() (bool, error) {
 	newBDs := GetNewBDFromCSPC(bdr.NewCSPC, bdr.OldCSPC)
 
 	for newBD, OldBD := range newBDs {
 		err := createBDC(newBD, OldBD, bdr.OldCSPC)
 		if err != nil {
-			return false, fmt.Sprintf("could not create bdc for bd %s : %s", newBD, err.Error())
+			return false, errors.Errorf("could not create bdc for bd %s : %s", newBD, err.Error())
 		}
 	}
-
-	return true, ""
+	return true, nil
 }
 
 // IsMoreThanOneDiskReplaced returns true if more than one disk is replaced in the same raid group.
@@ -184,7 +187,7 @@ func (bdr *BlockDeviceReplacement) IsExistingReplacmentInProgress(oldRG apis.Rai
 		if err != nil {
 			return true, errors.Errorf("failed to query for any existing replacement in the raid group : %s", err.Error())
 		}
-		if bdcObject.HasAnnotationKey("openebs.io/bd-predecessor") {
+		if bdcObject.HasAnnotationKey(apis.PredecessorBDKey) {
 			return true, errors.Errorf("replacement is still in progress for bd %s", v.BlockDeviceName)
 		}
 	}
@@ -239,7 +242,7 @@ func (bdr *BlockDeviceReplacement) GetPredecessorBDIfAny(cspcOld *apis.CStorPool
 				if err != nil {
 					return err, nil
 				}
-				predecessorBDMap[bdc.Object.GetAnnotations()["openebs.io/bd-predecessor"]] = true
+				predecessorBDMap[bdc.Object.GetAnnotations()[apis.PredecessorBDKey]] = true
 			}
 		}
 	}
@@ -306,8 +309,8 @@ func createBDC(newBD string, oldBD string, cspcOld *apis.CStorPoolCluster) error
 func ClaimBD(newBdObj *ndmapis.BlockDevice, oldBD string, cspcOld *apis.CStorPoolCluster) error {
 	newBDCObj, err := bdc.NewBuilder().
 		WithName("bdc-cstor-" + string(newBdObj.UID)).
-		WithNamespace("openebs").
-		WithLabels(map[string]string{string(apis.CStorPoolClusterCPK): cspcOld.Name, "openebs.io/bd-predecessor": oldBD}).
+		WithNamespace(cspcOld.Namespace).
+		WithLabels(map[string]string{string(apis.CStorPoolClusterCPK): cspcOld.Name, apis.PredecessorBDKey: oldBD}).
 		WithBlockDeviceName(newBdObj.Name).
 		WithHostName(newBdObj.Labels[string(apis.HostNameCPK)]).
 		WithCapacity(volume.ByteCount(newBdObj.Spec.Capacity.Storage)).
@@ -318,7 +321,7 @@ func ClaimBD(newBdObj *ndmapis.BlockDevice, oldBD string, cspcOld *apis.CStorPoo
 	if err != nil {
 		return errors.Wrapf(err, "failed to build block device claim for bd {%s}", newBdObj.Name)
 	}
-	_, err = bdc.NewKubeClient().WithNamespace("openebs").Create(newBDCObj.Object)
+	_, err = bdc.NewKubeClient().WithNamespace(cspcOld.Namespace).Create(newBDCObj.Object)
 	if k8serror.IsAlreadyExists(err) {
 		klog.Infof("BDC for BD {%s} already created", newBdObj.Name)
 		return nil

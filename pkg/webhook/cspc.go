@@ -162,6 +162,9 @@ func (wh *webhook) validateCSPCUpdateRequest(req *v1beta1.AdmissionRequest) *v1b
 		return response
 	}
 
+	// TODO : Do not allow swapping of block device in a raid group.
+	// TODO : Do not allow removal of block device in a raid group.
+
 	bdrv := NewBlockDeviceReplacement(NewBlockDeviceReplacementObject().WithNewCSPC(&cspcNew).WithOldCSPC(cspcOld))
 	if ok, msg := ValidateForBDReplacementCase(&cspcNew, cspcOld, bdrv); !ok {
 		err := errors.Errorf("invalid cspc specification: %s", msg)
