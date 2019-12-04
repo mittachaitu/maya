@@ -162,11 +162,16 @@ func (wh *webhook) validateCSPCUpdateRequest(req *v1beta1.AdmissionRequest) *v1b
 		return response
 	}
 
-	// TODO : Do not allow swapping of block device in a raid group.
-	// TODO : Do not allow removal of block device in a raid group.
+	bdr := NewBlockDeviceReplacement().WithNewCSPC(&cspcNew).WithOldCSPC(cspcOld)
+	commonPoolSpec, err := GetCommonPoolSpecs(&cspcNew, cspcOld)
 
-	bdrv := NewBlockDeviceReplacement(NewBlockDeviceReplacementObject().WithNewCSPC(&cspcNew).WithOldCSPC(cspcOld))
-	if ok, msg := ValidateForBDReplacementCase(&cspcNew, cspcOld, bdrv); !ok {
+	if err != nil {
+		err := errors.Errorf("could not find common pool specs for validation: %s", err.Error())
+		response = BuildForAPIObject(response).UnSetAllowed().WithResultAsFailure(err, http.StatusInternalServerError).AR
+		return response
+	}
+
+	if ok, msg := ValidateForBDReplacementCase(commonPoolSpec, bdr); !ok {
 		err := errors.Errorf("invalid cspc specification: %s", msg)
 		response = BuildForAPIObject(response).UnSetAllowed().WithResultAsFailure(err, http.StatusUnprocessableEntity).AR
 		return response

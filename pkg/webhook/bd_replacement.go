@@ -18,6 +18,7 @@ package webhook
 
 import (
 	"fmt"
+	nodeselect "github.com/openebs/maya/pkg/algorithm/nodeselect/v1alpha2"
 	ndmapis "github.com/openebs/maya/pkg/apis/openebs.io/ndm/v1alpha1"
 	apis "github.com/openebs/maya/pkg/apis/openebs.io/v1alpha1"
 	bd "github.com/openebs/maya/pkg/blockdevice/v1alpha2"
@@ -38,12 +39,8 @@ type BlockDeviceReplacement struct {
 	NewCSPC *apis.CStorPoolCluster
 }
 
-type BlockDeviceReplacementValidation struct {
-	BlockDeviceReplacement BDReplacementInterface
-}
-
 // NewBlockDeviceReplacementObject returns an empty BlockDeviceReplacement object.
-func NewBlockDeviceReplacementObject() *BlockDeviceReplacement {
+func NewBlockDeviceReplacement() *BlockDeviceReplacement {
 	return &BlockDeviceReplacement{
 		OldCSPC: &apis.CStorPoolCluster{},
 		NewCSPC: &apis.CStorPoolCluster{},
@@ -63,28 +60,87 @@ func (bdr *BlockDeviceReplacement) WithNewCSPC(newCSPC *apis.CStorPoolCluster) *
 	return bdr
 }
 
-type BDReplacementInterface interface {
-	IsBDReplacementValid(newRG apis.RaidGroup, oldRG apis.RaidGroup) (bool, string)
-}
-
-// NewBlockDeviceReplacement returns a BlockDeviceReplacement interface.
-func NewBlockDeviceReplacement(bdr *BlockDeviceReplacement) *BlockDeviceReplacementValidation {
-	return &BlockDeviceReplacementValidation{BlockDeviceReplacement: bdr}
+type poolspecs struct {
+	old []apis.PoolSpec
+	new []apis.PoolSpec
 }
 
 // ValidateForBDReplacementCase validates the changes in CSPC for block device replacement in a raid group only if the
 // update/edit of CSPC can trigger a block device replacement.
-func ValidateForBDReplacementCase(cspcNew, cspcOld *apis.CStorPoolCluster, bdrv *BlockDeviceReplacementValidation) (bool, string) {
-	for i, newPool := range cspcNew.Spec.Pools {
-		for j, newRaidGroup := range newPool.RaidGroups {
-			if IsBlockDeviceReplacementCase(newRaidGroup, cspcOld.Spec.Pools[i].RaidGroups[j]) {
-				if ok, msg := bdrv.BlockDeviceReplacement.IsBDReplacementValid(newRaidGroup, cspcOld.Spec.Pools[i].RaidGroups[j]); !ok {
-					return false, msg
+func ValidateForBDReplacementCase(commonPoolSpecs *poolspecs, bdr *BlockDeviceReplacement) (bool, string) {
+	for i, oldPoolSpec := range commonPoolSpecs.old {
+		if ok, msg := bdr.IsReplacementValid(&oldPoolSpec, &commonPoolSpecs.new[i]); !ok {
+			return false, msg
+		}
+	}
+	return true, ""
+}
+
+func GetCommonPoolSpecs(cspcNew, cspcOld *apis.CStorPoolCluster) (*poolspecs, error) {
+	commonPoolSpecs := &poolspecs{
+		old: []apis.PoolSpec{},
+		new: []apis.PoolSpec{},
+	}
+	for _, oldPool := range cspcOld.Spec.Pools {
+		oldNodeName, err := nodeselect.GetNodeFromLabelSelector(oldPool.NodeSelector)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, newPool := range cspcNew.Spec.Pools {
+			newNodeName, err := nodeselect.GetNodeFromLabelSelector(oldPool.NodeSelector)
+			if err != nil {
+				return nil, err
+			}
+			if oldNodeName == newNodeName {
+				commonPoolSpecs.old = append(commonPoolSpecs.old, oldPool)
+				commonPoolSpecs.new = append(commonPoolSpecs.new, newPool)
+			}
+		}
+	}
+	return commonPoolSpecs, nil
+}
+
+func (bdr *BlockDeviceReplacement) IsReplacementValid(oldPoolSpec, newPoolSpec *apis.PoolSpec) (bool, string) {
+	newToOldBd := make(map[string]string)
+	for _, oldRg := range oldPoolSpec.RaidGroups {
+		for _, newRg := range newPoolSpec.RaidGroups {
+			if IsRaidGroupCommon(oldRg, newRg) {
+				if IsBlockDeviceReplacementCase(oldRg, newRg) {
+					if ok, msg := bdr.IsBDReplacementValid(newRg, oldRg); !ok {
+						return false, msg
+					} else {
+						newBD := GetNewBDFromRaidGroups(newRg, oldRg)
+						for k, v := range newBD {
+							newToOldBd[k] = v
+						}
+					}
 				}
 			}
 		}
 	}
+
+	for newBD, oldBD := range newToOldBd {
+		err := createBDC(newBD, oldBD, bdr.OldCSPC)
+		if err != nil {
+			return false, err.Error()
+		}
+	}
 	return true, ""
+}
+
+func IsRaidGroupCommon(rgOld, rgNew apis.RaidGroup) bool {
+	oldBdMap := make(map[string]bool)
+	for _, bd := range rgOld.BlockDevices {
+		oldBdMap[bd.BlockDeviceName] = true
+	}
+
+	for _, bd := range rgNew.BlockDevices {
+		if oldBdMap[bd.BlockDeviceName] {
+			return true
+		}
+	}
+	return false
 }
 
 // IsBlockDeviceReplacementCase returns true if the edit/update of CSPC can trigger a blockdevice
@@ -140,18 +196,6 @@ func (bdr *BlockDeviceReplacement) IsBDReplacementValid(newRG apis.RaidGroup, ol
 	}
 
 	return true, ""
-}
-
-func (bdr *BlockDeviceReplacement) CreateBDCsForNewBDs() (bool, error) {
-	newBDs := GetNewBDFromCSPC(bdr.NewCSPC, bdr.OldCSPC)
-
-	for newBD, OldBD := range newBDs {
-		err := createBDC(newBD, OldBD, bdr.OldCSPC)
-		if err != nil {
-			return false, errors.Errorf("could not create bdc for bd %s : %s", newBD, err.Error())
-		}
-	}
-	return true, nil
 }
 
 // IsMoreThanOneDiskReplaced returns true if more than one disk is replaced in the same raid group.
@@ -249,30 +293,6 @@ func (bdr *BlockDeviceReplacement) GetPredecessorBDIfAny(cspcOld *apis.CStorPool
 	return nil, predecessorBDMap
 }
 
-// GetNewBDFromCSPC returns a map of new successor bd to old bd for replacement in the CSPC.
-func GetNewBDFromCSPC(newCSPC, oldCSPC *apis.CStorPoolCluster) map[string]string {
-	newBDs := make(map[string]string)
-	oldBDMap := make(map[string]bool)
-	for _, pool := range oldCSPC.Spec.Pools {
-		for _, rg := range pool.RaidGroups {
-			for _, bd := range rg.BlockDevices {
-				oldBDMap[bd.BlockDeviceName] = true
-			}
-		}
-	}
-
-	for i, pool := range newCSPC.Spec.Pools {
-		for j, rg := range pool.RaidGroups {
-			for k, bd := range rg.BlockDevices {
-				if !oldBDMap[bd.BlockDeviceName] {
-					newBDs[bd.BlockDeviceName] = oldCSPC.Spec.Pools[i].RaidGroups[j].BlockDevices[k].BlockDeviceName
-				}
-			}
-		}
-	}
-	return newBDs
-}
-
 // getBDCOfBD returns the BDC object for corresponding BD.
 func (bdr *BlockDeviceReplacement) GetBDCOfBD(bdName string) (error, *bdc.BlockDeviceClaim) {
 	bdcList, err := bdc.NewKubeClient().List(v1.ListOptions{})
@@ -334,15 +354,30 @@ func ClaimBD(newBdObj *ndmapis.BlockDevice, oldBD string, cspcOld *apis.CStorPoo
 
 // GetNewBDFromRaidGroups returns a map of new successor bd to old bd for replacement in a raid group
 func GetNewBDFromRaidGroups(newRG apis.RaidGroup, oldRG apis.RaidGroup) map[string]string {
-	newBlockDeviceMap := make(map[string]string)
+	newToOldBlockDeviceMap := make(map[string]string)
 	oldBlockDevicesMap := make(map[string]bool)
+	newBlockDevicesMap := make(map[string]bool)
+
 	for _, bdOld := range oldRG.BlockDevices {
 		oldBlockDevicesMap[bdOld.BlockDeviceName] = true
 	}
-	for i, newRG := range newRG.BlockDevices {
+
+	for _, bdNew := range newRG.BlockDevices {
+		newBlockDevicesMap[bdNew.BlockDeviceName] = true
+	}
+	var newBD, oldBD string
+
+	for _, newRG := range newRG.BlockDevices {
 		if !oldBlockDevicesMap[newRG.BlockDeviceName] {
-			newBlockDeviceMap[newRG.BlockDeviceName] = oldRG.BlockDevices[i].BlockDeviceName
+			newBD = newRG.BlockDeviceName
 		}
 	}
-	return newBlockDeviceMap
+
+	for _, oldRG := range oldRG.BlockDevices {
+		if !newBlockDevicesMap[oldRG.BlockDeviceName] {
+			oldBD = oldRG.BlockDeviceName
+		}
+	}
+	newToOldBlockDeviceMap[newBD] = oldBD
+	return newToOldBlockDeviceMap
 }
