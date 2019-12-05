@@ -18,6 +18,7 @@ package webhook
 
 import (
 	"fmt"
+
 	nodeselect "github.com/openebs/maya/pkg/algorithm/nodeselect/v1alpha2"
 	ndmapis "github.com/openebs/maya/pkg/apis/openebs.io/ndm/v1alpha1"
 	apis "github.com/openebs/maya/pkg/apis/openebs.io/v1alpha1"
@@ -27,8 +28,8 @@ import (
 	"github.com/openebs/maya/pkg/volume"
 	"github.com/pkg/errors"
 	k8serror "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/klog"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // BlockDeviceReplacement contains old and new CSPC to validate for block device replacement
@@ -95,6 +96,7 @@ func GetCommonPoolSpecs(cspcNew, cspcOld *apis.CStorPoolCluster) (*poolspecs, er
 			if oldNodeName == newNodeName {
 				commonPoolSpecs.old = append(commonPoolSpecs.old, oldPool)
 				commonPoolSpecs.new = append(commonPoolSpecs.new, newPool)
+				break
 			}
 		}
 	}
@@ -201,11 +203,7 @@ func (bdr *BlockDeviceReplacement) IsBDReplacementValid(newRG apis.RaidGroup, ol
 // IsMoreThanOneDiskReplaced returns true if more than one disk is replaced in the same raid group.
 func IsMoreThanOneDiskReplaced(newRG apis.RaidGroup, oldRG apis.RaidGroup) bool {
 	count := GetNumberOfDiskReplaced(newRG, oldRG)
-
-	if count == 2 {
-		return true
-	}
-	return false
+	return count > 1
 }
 
 // IsNewBDPresentOnCurrentCSPC returns true if the new/incoming BD that will be used for replacement
@@ -286,16 +284,20 @@ func (bdr *BlockDeviceReplacement) GetPredecessorBDIfAny(cspcOld *apis.CStorPool
 				if err != nil {
 					return err, nil
 				}
-				predecessorBDMap[bdc.Object.GetAnnotations()[apis.PredecessorBDKey]] = true
+				if bdc != nil {
+					predecessorBDMap[bdc.Object.GetAnnotations()[apis.PredecessorBDKey]] = true
+				}
 			}
 		}
 	}
 	return nil, predecessorBDMap
 }
 
-// getBDCOfBD returns the BDC object for corresponding BD.
+// GetBDCOfBD returns the BDC object for corresponding BD.
 func (bdr *BlockDeviceReplacement) GetBDCOfBD(bdName string) (error, *bdc.BlockDeviceClaim) {
-	bdcList, err := bdc.NewKubeClient().List(v1.ListOptions{})
+	bdcList, err := bdc.NewKubeClient().
+		WithNamespace(bdr.NewCSPC.Namespace).
+		List(v1.ListOptions{})
 	if err != nil {
 		return errors.Errorf("failed to list bdc: %s", err.Error()), nil
 	}
@@ -314,7 +316,9 @@ func (bdr *BlockDeviceReplacement) GetBDCOfBD(bdName string) (error, *bdc.BlockD
 }
 
 func createBDC(newBD string, oldBD string, cspcOld *apis.CStorPoolCluster) error {
-	bdObj, err := bd.NewKubeClient().Get(newBD, v1.GetOptions{})
+	bdObj, err := bd.NewKubeClient().
+		WithNamespace(cspcOld.Namespace).
+		Get(newBD, v1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -329,7 +333,7 @@ func createBDC(newBD string, oldBD string, cspcOld *apis.CStorPoolCluster) error
 func ClaimBD(newBdObj *ndmapis.BlockDevice, oldBD string, cspcOld *apis.CStorPoolCluster) error {
 	newBDCObj, err := bdc.NewBuilder().
 		WithName("bdc-cstor-" + string(newBdObj.UID)).
-		WithNamespace(cspcOld.Namespace).
+		WithNamespace(newBdObj.Namespace).
 		WithLabels(map[string]string{string(apis.CStorPoolClusterCPK): cspcOld.Name, apis.PredecessorBDKey: oldBD}).
 		WithBlockDeviceName(newBdObj.Name).
 		WithHostName(newBdObj.Labels[string(apis.HostNameCPK)]).
@@ -341,15 +345,28 @@ func ClaimBD(newBdObj *ndmapis.BlockDevice, oldBD string, cspcOld *apis.CStorPoo
 	if err != nil {
 		return errors.Wrapf(err, "failed to build block device claim for bd {%s}", newBdObj.Name)
 	}
-	_, err = bdc.NewKubeClient().WithNamespace(cspcOld.Namespace).Create(newBDCObj.Object)
-	if k8serror.IsAlreadyExists(err) {
-		klog.Infof("BDC for BD {%s} already created", newBdObj.Name)
-		return nil
+
+	bdcClient := bdc.NewKubeClient().WithNamespace(newBdObj.Namespace)
+	bdcObj, err := bdcClient.Get(newBDCObj.Object.Name, metav1.GetOptions{})
+	if k8serror.IsNotFound(err) {
+		_, err = bdcClient.Create(newBDCObj.Object)
+		if err != nil {
+			return errors.Wrapf(err, "failed to create block device claim for bd {%s}", newBdObj.Name)
+		}
+	} else if err != nil {
+		return errors.Wrapf(err, "failed to get block device claim for bd {%s}", newBdObj.Name)
 	}
+
+	updatedBDCObj, err := bdc.BuilderForAPIObject(bdcObj).
+		WithAnnotations(map[string]string{apis.PredecessorBDKey: oldBD}).
+		Build()
 	if err != nil {
-		return errors.Wrapf(err, "failed to create block device claim for bd {%s}", newBdObj.Name)
+		return errors.Wrapf(err, "failed to add annotation on block device claim {%s}", bdcObj.Name)
 	}
-	return nil
+
+	_, err = bdcClient.
+		Update(updatedBDCObj.Object)
+	return err
 }
 
 // GetNewBDFromRaidGroups returns a map of new successor bd to old bd for replacement in a raid group
@@ -370,12 +387,14 @@ func GetNewBDFromRaidGroups(newRG apis.RaidGroup, oldRG apis.RaidGroup) map[stri
 	for _, newRG := range newRG.BlockDevices {
 		if !oldBlockDevicesMap[newRG.BlockDeviceName] {
 			newBD = newRG.BlockDeviceName
+			break
 		}
 	}
 
 	for _, oldRG := range oldRG.BlockDevices {
 		if !newBlockDevicesMap[oldRG.BlockDeviceName] {
 			oldBD = oldRG.BlockDeviceName
+			break
 		}
 	}
 	newToOldBlockDeviceMap[newBD] = oldBD

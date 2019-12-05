@@ -19,13 +19,15 @@ package webhook
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"reflect"
+
 	apis "github.com/openebs/maya/pkg/apis/openebs.io/v1alpha1"
 	cspcv1alpha1 "github.com/openebs/maya/pkg/cstor/poolcluster/v1alpha1"
 	"github.com/pkg/errors"
 	"k8s.io/api/admission/v1beta1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog"
-	"net/http"
 )
 
 // validateCSPC validates CSPC spec for Create, Update and Delete operation of the object.
@@ -155,10 +157,15 @@ func (wh *webhook) validateCSPCUpdateRequest(req *v1beta1.AdmissionRequest) *v1b
 		return response
 	}
 
-	cspcOld, err := cspcv1alpha1.NewKubeClient().Get(cspcNew.Name, v1.GetOptions{})
+	cspcOld, err := cspcv1alpha1.NewKubeClient().
+		WithNamespace(cspcNew.Namespace).
+		Get(cspcNew.Name, v1.GetOptions{})
 	if err != nil {
 		err := errors.Errorf("could not fetch existing cspc for validation: %s", err.Error())
 		response = BuildForAPIObject(response).UnSetAllowed().WithResultAsFailure(err, http.StatusInternalServerError).AR
+		return response
+	}
+	if reflect.DeepEqual(cspcOld, &cspcNew) {
 		return response
 	}
 
